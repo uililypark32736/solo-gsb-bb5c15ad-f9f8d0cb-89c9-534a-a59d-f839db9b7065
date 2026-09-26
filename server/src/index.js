@@ -3,7 +3,7 @@
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
-const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError } = require('./cutting');
+const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, scheduleBoards, UserError } = require('./cutting');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8080;
@@ -68,6 +68,21 @@ app.post('/api/batch-preview', (req, res) => {
       return res.status(err.statusCode).json({ ok: false, error: err.message });
     }
     console.error('批次预演计算失败：', err);
+    res.status(500).json({ ok: false, error: '服务器内部错误' });
+  }
+});
+
+// 机台开料排程：以生成方案时的输入快照重算排料（原方案不变），在 2～3 台机台间
+// 分配整板加工（每板不可拆分、超单刀上限的机台不可分配），输出逐板机台、起止秒数与总完工秒数
+app.post('/api/schedule', (req, res) => {
+  try {
+    const result = scheduleBoards(req.body);
+    res.json({ ok: true, result });
+  } catch (err) {
+    if (err instanceof UserError) {
+      return res.status(err.statusCode).json({ ok: false, error: err.message });
+    }
+    console.error('机台排程计算失败：', err);
     res.status(500).json({ ok: false, error: '服务器内部错误' });
   }
 });

@@ -442,6 +442,21 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 .batch-card { border-color: #a78bfa; background: #fdfcff; }
 .batch-subtitle { font-size: 14px; margin: 16px 0 6px; }
 
+/* ---- 机台开料排程 ---- */
+.schedule-section {
+  margin-top: 26px;
+  border-top: 2px solid #14b8a6;
+  padding-top: 4px;
+}
+.machine-list { margin-top: 10px; }
+.part-row.machine-row {
+  grid-template-columns: 1.1fr 1fr 1fr 1fr 34px;
+}
+.schedule-section .btn.primary { margin-top: 10px; }
+.schedule-section .alert { margin-top: 12px; }
+.schedule-result { margin-top: 14px; }
+.schedule-subtitle { font-size: 14px; margin: 18px 0 6px; }
+
 .site-footer {
   margin-top: 22px;
   text-align: center;
