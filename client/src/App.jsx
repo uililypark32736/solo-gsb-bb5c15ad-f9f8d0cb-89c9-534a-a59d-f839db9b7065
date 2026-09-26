@@ -31,6 +31,12 @@ const SAMPLE_ORDERS = [
 const EMPTY_PART = { name: '', width: '', height: '', quantity: 1 };
 const emptyOrder = (i) => ({ orderNo: '', parts: [{ ...EMPTY_PART }] });
 const EMPTY_STOCK = { id: '', width: '', height: '' };
+const EMPTY_MACHINE = { name: '', maxCutLength: '', speed: '', setupSeconds: '' };
+// 机台开料排程：2～3 台机台（唯一名称 / 最大单刀长度 / 切割速度 / 每板准备秒数）
+const SAMPLE_MACHINES = [
+  { name: 'M-1 推台锯', maxCutLength: 2440, speed: 120, setupSeconds: 30 },
+  { name: 'M-2 电子锯', maxCutLength: 1300, speed: 200, setupSeconds: 20 },
+];
 
 // 损坏件三元身份：订单号 + 零件名 + 件号（跨订单同名零件互不影响）
 const itemKey = (order, part, index) => JSON.stringify([order, part, index]);
@@ -88,6 +94,11 @@ export default function App() {
   const [batchResult, setBatchResult] = useState(null);
   const [batchError, setBatchError] = useState('');
   const [batchLoading, setBatchLoading] = useState(false);
+  // 机台开料排程：2～3 台机台参数、排程结果与状态（只读附加在已生成方案上，不改原排料）
+  const [machines, setMachines] = useState(SAMPLE_MACHINES.map((m) => ({ ...m })));
+  const [schedule, setSchedule] = useState(null);
+  const [scheduleError, setScheduleError] = useState('');
+  const [scheduleLoading, setScheduleLoading] = useState(false);
 
   // ---- 订单 / 零件行编辑 ----
   const updateOrder = (oi, key, value) => {
@@ -149,11 +160,14 @@ export default function App() {
     setMinOffcutWidth('');
     setStocks(SAMPLE_STOCKS.map((s) => ({ ...s })));
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
+    setMachines(SAMPLE_MACHINES.map((m) => ({ ...m })));
     setResult(null);
     setError('');
     resetRecut();
     resetCancel();
     resetOffcuts();
+    setSchedule(null);
+    setScheduleError('');
   };
 
   // 组装请求载荷并校验余板行：全空行忽略；非空行必须编号唯一且长 / 宽为正数
@@ -219,6 +233,8 @@ export default function App() {
     resetRecut();
     resetCancel();
     resetOffcuts();
+    setSchedule(null);
+    setScheduleError('');
     setLoading(true);
     try {
       const res = await fetch('/api/cut', {
@@ -381,6 +397,82 @@ export default function App() {
     }
   };
 
+  // ---- 机台开料排程 ----
+  const updateMachine = (mi, key, value) => {
+    setMachines((prev) => prev.map((m, idx) => (idx === mi ? { ...m, [key]: value } : m)));
+    // 机台参数变化后，旧排程不再适用
+    setSchedule(null);
+    setScheduleError('');
+  };
+  const addMachine = () => setMachines((prev) => (prev.length >= 3 ? prev : [...prev, { ...EMPTY_MACHINE }]));
+  const removeMachine = (mi) => setMachines((prev) => (prev.length <= 2 ? prev : prev.filter((_, idx) => idx !== mi)));
+
+  // 校验并组装机台清单：2～3 台，名称去空白后唯一，最大单刀长度 / 切割速度为正数、准备秒数非负
+  const buildMachines = () => {
+    if (machines.length < 2 || machines.length > 3) {
+      return { error: `机台数量必须为 2～3 台（当前 ${machines.length} 台）` };
+    }
+    const list = [];
+    const usedNames = new Set();
+    for (let i = 0; i < machines.length; i++) {
+      const m = machines[i];
+      const name = String(m.name ?? '').trim();
+      if (name === '') return { error: `第 ${i + 1} 台机台缺少唯一名称` };
+      if (usedNames.has(name)) return { error: `机台名称重复：${name}` };
+      const maxCutLength = Number(String(m.maxCutLength).trim());
+      const speed = Number(String(m.speed).trim());
+      const setupRaw = String(m.setupSeconds ?? '').trim();
+      const setupSeconds = setupRaw === '' ? 0 : Number(setupRaw);
+      if (!Number.isFinite(maxCutLength) || maxCutLength <= 0) {
+        return { error: `机台「${name}」的最大单刀长度必须为正数` };
+      }
+      if (!Number.isFinite(speed) || speed <= 0) {
+        return { error: `机台「${name}」的切割速度必须为正数（长度单位 / 秒）` };
+      }
+      if (!Number.isFinite(setupSeconds) || setupSeconds < 0) {
+        return { error: `机台「${name}」的每板准备秒数必须是非负数字` };
+      }
+      usedNames.add(name);
+      list.push({ name, maxCutLength, speed, setupSeconds });
+    }
+    return { machines: list };
+  };
+
+  const submitSchedule = async () => {
+    if (!result) return;
+    setScheduleError('');
+    const { payload, error: stockError } = buildPayload();
+    if (stockError) {
+      setScheduleError(stockError);
+      return;
+    }
+    const { machines: machineList, error: machineError } = buildMachines();
+    if (machineError) {
+      setScheduleError(machineError);
+      return;
+    }
+    setSchedule(null);
+    setScheduleLoading(true);
+    try {
+      // 后端以当前排料输入重算方案并分配机台；排程为只读附加结果，不改动原排料落位
+      const res = await fetch('/api/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, machines: machineList }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setScheduleError(data.error || '机台开料排程失败，请检查机台参数');
+      } else {
+        setSchedule(data.result);
+      }
+    } catch (err) {
+      setScheduleError('无法连接排料服务，请确认后端已启动');
+    } finally {
+      setScheduleLoading(false);
+    }
+  };
+
   // ---- 可回收余料清单：勾选与一键追加到临时余板库存 ----
   const toggleOffcut = (id) => {
     setOffcutSelected((prev) => {
@@ -442,7 +534,7 @@ export default function App() {
     <div className="page">
       <header className="site-header">
         <h1>矩形板材下料 · 多订单拼版断头切割排料</h1>
-        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；方案生成后自动列出可回收余料清单，可勾选一键追加回余板库存；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）；也可把当前表单依次保存为多批做连续批次用料预演（首批余板为初始库存，余料按批回收入池，逐批给出新开标准板与累计材料费）</p>
+        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；方案生成后自动列出可回收余料清单，可勾选一键追加回余板库存；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）；也可把当前表单依次保存为多批做连续批次用料预演（首批余板为初始库存，余料按批回收入池，逐批给出新开标准板与累计材料费）；方案生成后可登记 2～3 台机台（唯一名称、最大单刀长度、切割速度与每板准备秒数），遍历可行分配求总完工时间最小的机台开料排程（仅接受不超过 8 张板，逐板给出机台与起止秒数，不改原排料结果）</p>
       </header>
 
       <main className="layout">
@@ -675,6 +767,7 @@ export default function App() {
                 <li>方案生成后自动给出可回收余料清单（按可配置的最小长 / 宽筛选），可勾选一键追加为临时余板库存</li>
                 <li>选择一张订单即可预览撤单影响：按生成方案时的输入快照对比撤单前后用板与材料费，原方案不变</li>
                 <li>连续批次用料预演：依次保存多批表单快照，首批余板为初始库存，余料按批回收入池供后续批次使用，逐批给出新开标准板数与累计材料费</li>
+                <li>机台开料排程：登记 2～3 台机台（唯一名称 / 最大单刀长度 / 切割速度 / 每板准备秒数），仅对不超过 8 张板的方案遍历可行分配，求全部板总完工时间最小（逐板机台与起止秒数，实际最长刀超限的板不能分配，原排料结果不变）</li>
               </ul>
             </div>
           )}
@@ -706,6 +799,16 @@ export default function App() {
                 loading={cancelLoading}
                 onSubmit={submitCancelPreview}
               />
+              <ScheduleSection
+                machines={machines}
+                onUpdateMachine={updateMachine}
+                onAddMachine={addMachine}
+                onRemoveMachine={removeMachine}
+                schedule={schedule}
+                error={scheduleError}
+                loading={scheduleLoading}
+                onSubmit={submitSchedule}
+              />
             </>
           )}
 
@@ -716,7 +819,7 @@ export default function App() {
       </main>
 
       <footer className="site-footer">
-        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料 · 可回收余料取自各板最终空闲矩形（不含零件与锯缝），可追加为临时余板库存 · 补切仅重排所选损坏件，原方案不变 · 撤单预览按输入快照对比前后方案，表单与原方案不变 · 连续预演按批次快照逐批排料，余板池跨批流转，表单与单次方案不变
+        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料 · 可回收余料取自各板最终空闲矩形（不含零件与锯缝），可追加为临时余板库存 · 补切仅重排所选损坏件，原方案不变 · 撤单预览按输入快照对比前后方案，表单与原方案不变 · 连续预演按批次快照逐批排料，余板池跨批流转，表单与单次方案不变 · 机台排程每板不可拆分、按板号顺序连续加工，遍历可行分配求总完工时间最小（≤ 8 张板），原排料结果不变
       </footer>
     </div>
   );
@@ -1378,6 +1481,160 @@ function CancelPreviewResult({ preview }) {
 }
 
 /**
+ * 机台开料排程区块：输入 2～3 台机台（唯一名称 / 最大单刀长度 / 切割速度 /
+ * 每板准备秒数），为已生成的裁切方案分配机台。每板不可拆分，实际最长刀超过
+ * 机台上限则不能分配；遍历全部可行分配求总完工时间最小值，平局按板号对应机台
+ * 输入序号字典序；展示逐板机台与起止秒数、逐机台时间轴及总完工秒数。
+ * 排程为只读附加结果，不改动原排料落位与分摊。
+ */
+function ScheduleSection({ machines, onUpdateMachine, onAddMachine, onRemoveMachine, schedule, error, loading, onSubmit }) {
+  return (
+    <div className="schedule-section">
+      <h2 className="section-title">机台开料排程</h2>
+      <p className="hint">
+        为当前裁切方案登记 <b>2～3 台机台</b>（机台名称在本次排程中唯一；最大单刀长度、切割速度为正数，
+        每板准备秒数为非负数）。<b>每板不可拆分</b>：板的实际最长刀超过机台上限时该板不能分配给该机台；
+        单板耗时 = 准备秒数 + 该板全部刀长之和 ÷ 切割速度，同一机台<b>按板号顺序连续加工</b>。
+        系统遍历全部可行分配，求<b>全部板完成时间最小</b>的方案（平局按各板号所分配机台的
+        输入序号字典序取最先者），仅接受不超过 8 张板的方案；<b>原排料落位与材料费分摊保持不变</b>。
+      </p>
+      <div className="machine-list">
+        <div className="part-row part-row-head machine-row">
+          <span>序号</span>
+          <span>机台唯一名称</span>
+          <span>最大单刀长度</span>
+          <span>切割速度（长度/秒）</span>
+          <span>每板准备秒数</span>
+          <span className="op-col"></span>
+        </div>
+        {machines.map((m, mi) => (
+          <div className="part-row machine-row" key={mi}>
+            <span className="order-badge machine-index-badge">{mi + 1}</span>
+            <input type="text" value={m.name} placeholder={`如 M-${mi + 1}（唯一）`}
+              onChange={(e) => onUpdateMachine(mi, 'name', e.target.value)} />
+            <input type="number" step="any" min="0" value={m.maxCutLength} placeholder="如 2440"
+              onChange={(e) => onUpdateMachine(mi, 'maxCutLength', e.target.value)} />
+            <input type="number" step="any" min="0" value={m.speed} placeholder="如 120"
+              onChange={(e) => onUpdateMachine(mi, 'speed', e.target.value)} />
+            <input type="number" step="any" min="0" value={m.setupSeconds} placeholder="如 30"
+              onChange={(e) => onUpdateMachine(mi, 'setupSeconds', e.target.value)} />
+            <button type="button" className="btn icon op-col" title="删除该机台"
+              onClick={() => onRemoveMachine(mi)} disabled={machines.length <= 2}>✕</button>
+          </div>
+        ))}
+        <button type="button" className="btn ghost wide" onClick={onAddMachine} disabled={machines.length >= 3}>
+          ＋ 添加机台（{machines.length}/3）
+        </button>
+      </div>
+      <button
+        type="button"
+        className="btn primary"
+        disabled={loading || machines.length < 2}
+        onClick={onSubmit}
+      >
+        {loading ? '正在生成机台排程…' : `生成机台开料排程（${machines.length} 台机台）`}
+      </button>
+
+      {error && (
+        <div className="alert" role="alert">
+          <strong>无法排程：</strong>{error}
+        </div>
+      )}
+
+      {schedule && <ScheduleResult schedule={schedule} />}
+    </div>
+  );
+}
+
+function ScheduleResult({ schedule }) {
+  const { makespan, assignments, machineSchedules } = schedule;
+  const pct = (sec) => (makespan > 0 ? Math.max(0, Math.min(100, (sec / makespan) * 100)) : 0);
+  return (
+    <div className="schedule-result">
+      <div className="stat-grid">
+        <div className="stat accent"><b>{fmtSec(makespan)} 秒</b><span>全部板总完工时间（makespan）</span></div>
+        <div className="stat"><b>{schedule.boardsCount}</b><span>排程板数（≤ 8）</span></div>
+        <div className="stat"><b>{schedule.machinesCount}</b><span>参与机台数</span></div>
+        <div className="stat"><b>{fmt(schedule.totalCutLength)}</b><span>全部刀长之和</span></div>
+      </div>
+
+      {/* 逐机台时间轴：同一机台按板号顺序连续加工 */}
+      <h3 className="schedule-subtitle">逐机台加工时间轴（按板号顺序连续加工）</h3>
+      <div className="schedule-timeline">
+        <div className="gantt-scale">
+          {[0, 0.25, 0.5, 0.75, 1].map((r) => (
+            <span key={r} style={{ left: `${r * 100}%` }}>{fmtSec(makespan * r)} 秒</span>
+          ))}
+        </div>
+        {machineSchedules.map((ms) => (
+          <div className="machine-timeline-row" key={ms.machine}>
+            <div className="machine-timeline-head">
+              <span className="machine-name">{ms.machineIndex}. {ms.machine}</span>
+              <span className="machine-spec">
+                上限 {strip(ms.maxCutLength)} · 速度 {strip(ms.speed)}/秒 · 准备 {fmtSec(ms.setupSeconds)} 秒
+              </span>
+              <span className="machine-finish">完工 {fmtSec(ms.finishSeconds)} 秒</span>
+            </div>
+            <div className="machine-gantt">
+              {ms.boards.length === 0 ? (
+                <span className="gantt-idle">本机台未分配板</span>
+              ) : (
+                ms.boards.map((b) => (
+                  <div
+                    key={b.board}
+                    className="gantt-block"
+                    style={{ left: `${pct(b.startSeconds)}%`, width: `${pct(b.durationSeconds)}%` }}
+                    title={`第 ${b.board} 板：${fmtSec(b.startSeconds)} → ${fmtSec(b.endSeconds)} 秒，耗时 ${fmtSec(b.durationSeconds)} 秒`}
+                  >
+                    <b>{b.board}</b>
+                    <i>{fmtSec(b.durationSeconds)} 秒</i>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 逐板排程明细 */}
+      <h3 className="schedule-subtitle">逐板机台与起止秒数（按板号升序）</h3>
+      <table className="detail-table schedule-table">
+        <thead>
+          <tr>
+            <th>板号</th><th>机台（输入序号）</th><th>实际最长刀 / 机台上限</th>
+            <th>刀数</th><th>刀长合计</th><th>准备秒数</th><th>切割秒数</th>
+            <th>单板耗时（秒）</th><th>开始秒</th><th>结束秒</th>
+          </tr>
+        </thead>
+        <tbody>
+          {assignments.map((a) => (
+            <tr key={a.board}>
+              <td><span className="board-num">{a.board}</span></td>
+              <td><b>{a.machine}</b>（第 {a.machineIndex} 台）</td>
+              <td className={a.longestCut > a.maxCutLength ? 'cut-over' : ''}>
+                {strip(a.longestCut)} / {strip(a.maxCutLength)}
+              </td>
+              <td>{a.cutsCount}</td>
+              <td>{strip(a.totalCutLength)}</td>
+              <td>{fmtSec(a.setupSeconds)}</td>
+              <td>{fmtSec(a.cuttingSeconds)}</td>
+              <td><b>{fmtSec(a.durationSeconds)}</b></td>
+              <td>{fmtSec(a.startSeconds)}</td>
+              <td><b>{fmtSec(a.endSeconds)}</b></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="hint">
+        单板耗时 = 每板准备秒数 + 该板全部刀长之和 ÷ 切割速度；各机台加工其板号队列时串行累计，
+        所有机台完工秒数的最大值即<b>全部板总完工时间 {fmtSec(makespan)} 秒</b>
+        （平局已按板号对应机台输入序号字典序取最先者）。本排程为只读附加结果，原排料方案不变。
+      </p>
+    </div>
+  );
+}
+
+/**
  * 连续批次用料预演结果区块：按保存顺序逐批展示新开标准板数、已用 / 新增余板、
  * 批末库存与累计材料费；某批无法加工时后端指出批次并停止，不返回部分结果。
  * 预演为只读评估，不改动表单与单次排料结果。
@@ -1558,5 +1815,9 @@ function fmt(n) {
   return Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
 }
 function strip(n) {
+  return Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+}
+// 秒数显示：保留最多 3 位小数，去掉多余尾零
+function fmtSec(n) {
   return Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 3 });
 }

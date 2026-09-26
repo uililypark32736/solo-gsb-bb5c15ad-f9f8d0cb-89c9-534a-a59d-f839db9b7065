@@ -448,3 +448,107 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
   font-size: 12px;
   color: var(--muted);
 }
+
+/* ---- 机台开料排程 ---- */
+.schedule-section {
+  margin-top: 26px;
+  border-top: 2px solid #fb7185;
+  padding-top: 4px;
+}
+.schedule-section .btn.primary { margin-top: 10px; }
+.schedule-section .alert { margin-top: 12px; }
+.machine-list { margin-top: 10px; }
+.part-row.machine-row {
+  grid-template-columns: 26px 1.3fr 0.95fr 1fr 0.95fr 34px;
+}
+.machine-index-badge { flex: none; }
+.schedule-result { margin-top: 14px; }
+.schedule-subtitle { font-size: 14px; margin: 18px 0 6px; }
+.schedule-table td, .schedule-table th { white-space: nowrap; }
+.schedule-table .cut-over { color: var(--danger-text); font-weight: 700; }
+
+.schedule-timeline {
+  margin-top: 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 12px 12px;
+  background: #f8fafc;
+}
+.gantt-scale {
+  position: relative;
+  height: 18px;
+  margin: 2px 0 4px;
+  border-bottom: 1px dashed #cbd5e1;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.gantt-scale span {
+  position: absolute;
+  transform: translateX(-50%);
+}
+.gantt-scale span:first-child { transform: translateX(0); }
+.gantt-scale span:last-child { transform: translateX(-100%); }
+.machine-timeline-row { margin-top: 8px; }
+.machine-timeline-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+.machine-name { font-weight: 700; font-size: 13px; }
+.machine-spec { color: var(--muted); font-variant-numeric: tabular-nums; }
+.machine-finish {
+  margin-left: auto;
+  font-weight: 700;
+  color: #be123c;
+  font-variant-numeric: tabular-nums;
+}
+.machine-gantt {
+  position: relative;
+  height: 26px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.gantt-idle {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+.gantt-block {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  min-width: 2px;
+  background: linear-gradient(180deg, #fb7185, #e11d48);
+  border: 1px solid #be123c;
+  border-radius: 4px;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  overflow: hidden;
+  cursor: default;
+}
+.gantt-block b {
+  font-size: 11px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.gantt-block i {
+  font-size: 9px;
+  font-style: normal;
+  line-height: 1.1;
+  opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+}

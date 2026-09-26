@@ -64,6 +64,18 @@
  *    与历史编号冲突时自动追加 -2、-3… 后缀，全程编号不重复；
  *  - 逐批输出新开标准板数、已用 / 新增余板、批末库存与累计材料费；
  *  - 任一批无法加工时报错指出批次并停止，不返回任何批次结果；预演不改动输入快照。
+ *
+ * 机台开料排程（scheduleBoards）：
+ *  - 输入 = 排料输入（同 cutBoards）+ machines：2～3 台机台，每台带唯一名称、
+ *    最大单刀长度（正数）、切割速度（正数，长度 / 秒）与每板准备秒数（非负）；
+ *  - 仅接受不超过 8 张板的方案，超出直接报错；每板不可拆分，板的实际最长刀长
+ *    超过机台最大单刀长度时该板不能分配给该机台，全部机台都超限时报错指出板号；
+ *  - 单板耗时 = 每板准备秒数 + 该板全部刀长之和 ÷ 切割速度；同一机台按板号顺序
+ *    连续加工（准备 / 切割不跨机台并行拆分）；
+ *  - 遍历全部可行分配，求所有板完成时间（makespan）最小的方案；完工时间相同时，
+ *    按“各板号所分配机台的输入序号”向量字典序选最先者；
+ *  - 输出逐板机台与起止秒数、逐机台板号顺序与完工秒数及总完工秒数；
+ *  - 排程以当前排料输入重算方案，为只读附加结果：原排料落位、刀路与分摊不变。
  */
 
 const EPS = 1e-9;
@@ -1325,4 +1337,218 @@ function batchPreviewBoards(input) {
   };
 }
 
-module.exports = { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError };
+/**
+ * 解析机台清单 machines：2～3 台，每项 { name, maxCutLength, speed, setupSeconds }。
+ *  - name：机台唯一名称（去空白后非空、全表不可重复）；
+ *  - maxCutLength：机台最大单刀长度，必须为正数（与板尺寸 / 刀长同单位）；
+ *  - speed：切割速度，必须为正数（长度单位 / 秒）；
+ *  - setupSeconds：每板准备秒数，必须为非负数。
+ * 返回按输入顺序排列的归一化机台数组。
+ */
+function parseMachines(value) {
+  if (!Array.isArray(value)) {
+    throw new UserError('机台清单格式不正确（需要 2～3 台机台）');
+  }
+  if (value.length < 2 || value.length > 3) {
+    throw new UserError(`机台数量必须为 2～3 台（当前 ${value.length} 台）`);
+  }
+  const machines = [];
+  const usedNames = new Set();
+  value.forEach((m, i) => {
+    if (!m || typeof m !== 'object') {
+      throw new UserError(`第 ${i + 1} 台机台格式不正确`);
+    }
+    const name = m.name === undefined || m.name === null ? '' : String(m.name).trim();
+    if (!name) {
+      throw new UserError(`第 ${i + 1} 台机台缺少唯一名称`);
+    }
+    if (usedNames.has(name)) {
+      throw new UserError(`机台名称重复：${name}`);
+    }
+    const maxCutLength = num(m.maxCutLength, `机台「${name}」的最大单刀长度`);
+    const speed = num(m.speed, `机台「${name}」的切割速度`);
+    const setupSeconds = m.setupSeconds === undefined || m.setupSeconds === null || m.setupSeconds === ''
+      ? 0
+      : num(m.setupSeconds, `机台「${name}」的每板准备秒数`);
+    if (maxCutLength <= 0) {
+      throw new UserError(`机台「${name}」的最大单刀长度必须大于 0`);
+    }
+    if (speed <= 0) {
+      throw new UserError(`机台「${name}」的切割速度必须大于 0`);
+    }
+    if (setupSeconds < 0) {
+      throw new UserError(`机台「${name}」的每板准备秒数不能为负数`);
+    }
+    usedNames.add(name);
+    machines.push({ name, maxCutLength, speed, setupSeconds });
+  });
+  return machines;
+}
+
+/**
+ * 机台开料排程。
+ * 输入 = 排料输入（同 cutBoards）+ machines：2～3 台机台（parseMachines 格式）。
+ *
+ * 流程：
+ *  1. 以当前排料输入重算裁切方案（与 /api/cut 相同规则；排程为只读附加结果，
+ *     不改动原方案落位与分摊）；
+ *  2. 仅接受 boardsCount ≤ 8 的方案，超出明确报错；
+ *  3. 每板不可拆分：板的实际最长刀长（无刀为 0）超过某机台最大单刀长度时，
+ *     该板不能分配给该机台；某板在所有机台上都超限时报错并指出板号；
+ *  4. 单板耗时 = setupSeconds + 该板全部刀长之和 ÷ speed；同一机台按板号升序
+ *     连续加工（板不拆分，准备与切割均在同一机台内完成）；
+ *  5. 遍历全部可行分配（板数 ≤ 8、机台 ≤ 3，枚举量 ≤ 3^8 = 6561），求全部板
+ *     完成时间（各机台累计耗时最大值）最小者；完工时间相同（相对容差内）时，
+ *     按“各板号所分配机台的输入序号”向量字典序取最先者（DFS 按板号顺序、
+ *     机台序号升序枚举，首个最优可行向量即字典序最小）。
+ *
+ * 返回 { plan, machines, boardsCount, feasible, makespan, totalCutLength,
+ *         assignments, machineSchedules }：
+ *  - assignments[]：逐板机台、最长刀长、刀长合计、单板耗时与起止秒数（按板号升序）；
+ *  - machineSchedules[]：逐机台按板号顺序的加工清单与完工秒数（未分配板时为 0）。
+ */
+function scheduleBoards(input) {
+  if (!input || typeof input !== 'object') {
+    throw new UserError('请求体格式不正确');
+  }
+  const machines = parseMachines(input.machines);
+
+  // 以当前排料输入重算方案；排程只读，不改原排料结果
+  const plan = cutBoards(input);
+  const boards = plan.boards;
+
+  if (boards.length > 8) {
+    throw new UserError(
+      `机台开料排程仅接受不超过 8 张板的方案：当前方案共 ${boards.length} 张板，已超出上限，请先调整订单或板材参数`
+    );
+  }
+
+  // 逐板：实际最长刀长 / 全部刀长之和（取自原方案刀路；无刀时均为 0）
+  const boardInfo = boards.map((b) => {
+    const totalCutLength = b.cuts.reduce((s, c) => s + c.length, 0);
+    return {
+      index: b.index,
+      longestCut: b.longestCut,
+      totalCutLength,
+    };
+  });
+
+  // 各机台对各板的可行性与单板耗时（秒）：实际最长刀超过机台上限则不能分配
+  const canRun = boardInfo.map((info) => machines.map((m) => info.longestCut <= m.maxCutLength + EPS));
+  const duration = boardInfo.map((info, bi) => machines.map(
+    (m, mi) => (canRun[bi][mi] ? m.setupSeconds + info.totalCutLength / m.speed : Infinity)
+  ));
+
+  // 无可行机台的板：明确指出板号（一次性列出全部，便于现场判断）
+  const infeasibleBoards = boardInfo
+    .filter((info, bi) => !machines.some((_, mi) => canRun[bi][mi]))
+    .map((info) => {
+      const caps = machines.map((m) => `${m.name} 上限 ${round3(m.maxCutLength)}`).join('、');
+      return `第 ${info.index} 张板实际最长刀长 ${round3(info.longestCut)}（${caps}）`;
+    });
+  if (infeasibleBoards.length > 0) {
+    throw new UserError(
+      `以下板没有可加工的机台（板不可拆分，实际最长刀超过全部机台上限）：${infeasibleBoards.join('；')}`
+    );
+  }
+
+  // 遍历可行分配：DFS 按板号顺序、机台输入序号升序枚举，故 makespan 相同时
+  // 首个命中的分配向量即“板号对应机台输入序号”字典序最小者
+  let bestAssign = null;
+  let bestMakespan = Infinity;
+  const assign = new Array(boards.length).fill(-1);
+  const machineLoad = new Array(machines.length).fill(0);
+
+  const dfs = (bi) => {
+    if (bi === boards.length) {
+      const makespan = machineLoad.reduce((mx, t) => (t > mx ? t : mx), 0);
+      if (bestAssign === null || makespan < bestMakespan - 1e-9 * Math.max(1, makespan, bestMakespan)) {
+        bestMakespan = makespan;
+        bestAssign = assign.slice();
+      }
+      return;
+    }
+    for (let mi = 0; mi < machines.length; mi++) {
+      if (!canRun[bi][mi]) continue;
+      const prevLoad = machineLoad[mi];
+      machineLoad[mi] = prevLoad + duration[bi][mi];
+      assign[bi] = mi;
+      dfs(bi + 1);
+      machineLoad[mi] = prevLoad;
+      assign[bi] = -1;
+    }
+  };
+  dfs(0);
+
+  // bestAssign 必非空：每块板至少有一台可行机台（否则已在上方报错）
+  const makespan = bestMakespan;
+
+  // 逐板排程行：同一机台按板号升序连续加工，起止秒数随该板在机台队列中的位置累计
+  const machineCursor = new Array(machines.length).fill(0);
+  const machineBoardLists = machines.map(() => []);
+  const assignments = boardInfo.map((info, bi) => {
+    const mi = bestAssign[bi];
+    const m = machines[mi];
+    const start = machineCursor[mi];
+    const end = start + duration[bi][mi];
+    machineCursor[mi] = end;
+    machineBoardLists[mi].push({ board: info.index, start, end, duration: duration[bi][mi] });
+    return {
+      board: info.index,
+      machine: m.name,
+      machineIndex: mi + 1, // 机台输入序号（从 1 起）
+      longestCut: round3(info.longestCut),
+      maxCutLength: round3(m.maxCutLength),
+      totalCutLength: round3(info.totalCutLength),
+      cutsCount: boards[bi].cuts.length,
+      setupSeconds: round3(m.setupSeconds),
+      cuttingSeconds: round3(info.totalCutLength / m.speed),
+      durationSeconds: round3(duration[bi][mi]),
+      startSeconds: round3(start),
+      endSeconds: round3(end),
+    };
+  });
+
+  const machineSchedules = machines.map((m, mi) => ({
+    machine: m.name,
+    machineIndex: mi + 1,
+    maxCutLength: round3(m.maxCutLength),
+    speed: round3(m.speed),
+    setupSeconds: round3(m.setupSeconds),
+    boardCount: machineBoardLists[mi].length,
+    boards: machineBoardLists[mi].map((x) => ({
+      board: x.board,
+      startSeconds: round3(x.start),
+      endSeconds: round3(x.end),
+      durationSeconds: round3(x.duration),
+    })),
+    finishSeconds: round3(machineCursor[mi]),
+    busySeconds: round3(machineCursor[mi]),
+  }));
+
+  return {
+    plan,
+    machinesCount: machines.length,
+    machines: machines.map((m) => ({
+      name: m.name,
+      maxCutLength: round3(m.maxCutLength),
+      speed: round3(m.speed),
+      setupSeconds: round3(m.setupSeconds),
+    })),
+    boardsCount: boards.length,
+    totalCutLength: round3(boardInfo.reduce((s, info) => s + info.totalCutLength, 0)),
+    feasible: true,
+    makespan: round3(makespan),
+    assignments,
+    machineSchedules,
+  };
+}
+
+module.exports = {
+  cutBoards,
+  recutBoards,
+  cancelPreviewBoards,
+  batchPreviewBoards,
+  scheduleBoards,
+  UserError,
+};

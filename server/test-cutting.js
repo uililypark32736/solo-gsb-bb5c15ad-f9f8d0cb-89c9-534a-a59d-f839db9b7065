@@ -1,7 +1,7 @@
 /* 排料算法自检：面积守恒、刀路几何、多板、旋转与报错路径 */
 'use strict';
 const assert = require('assert');
-const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError } = require('./src/cutting');
+const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, scheduleBoards, UserError } = require('./src/cutting');
 
 // 1) 示例数据：面积守恒 + 基本字段
 const r = cutBoards({
@@ -966,5 +966,169 @@ const bpIn = {
 const bpInCopy = JSON.parse(JSON.stringify(bpIn));
 batchPreviewBoards(bpIn);
 assert.deepStrictEqual(bpIn, bpInCopy, '预演不得改动各批输入快照');
+
+// ---- 机台开料排程 ----
+// 公共排料：1200×800、锯缝 0，600×400 × 9 件 => 3 张板（4/4/1 件）；
+// 满板刀路合计 2000（竖 800 + 横 600 + 竖 400）、实际最长刀 800；
+// 单板（板3）刀路合计 1400（竖 800 + 横 600）、实际最长刀 800。
+const schedBase = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0,
+  parts: [{ name: '块', width: 600, height: 400, quantity: 9 }],
+};
+
+// 47) 最优分配 + 平局字典序：速度 1000、无准备 => 板1/2 各 2 秒、板3 1.4 秒；
+//     最优 makespan = 3.4；达到 3.4 的最字典序向量（机台输入序号，从 1 起）为 [1,2,1]
+const sch = scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] });
+assert.strictEqual(sch.boardsCount, 3);
+assert.strictEqual(sch.machinesCount, 2);
+assert.strictEqual(sch.makespan, 3.4);
+assert.deepStrictEqual(sch.assignments.map((a) => a.machineIndex), [1, 2, 1]);
+assert.deepStrictEqual(sch.assignments.map((a) => a.machine), ['M-A', 'M-B', 'M-A']);
+// 逐板起止秒数
+assert.deepStrictEqual(sch.assignments.map((a) => [a.startSeconds, a.endSeconds]), [[0, 2], [0, 2], [2, 3.4]]);
+assert.deepStrictEqual(sch.assignments.map((a) => a.durationSeconds), [2, 2, 1.4]);
+// 同一机台按板号顺序连续加工，机台完工秒数 = makespan / 2
+assert.deepStrictEqual(sch.machineSchedules[0].boards.map((b) => b.board), [1, 3]);
+assert.deepStrictEqual(sch.machineSchedules[1].boards.map((b) => b.board), [2]);
+assert.strictEqual(sch.machineSchedules[0].finishSeconds, 3.4);
+assert.strictEqual(sch.machineSchedules[1].finishSeconds, 2);
+assert.strictEqual(sch.totalCutLength, 5400);
+// 枚举校验：手动遍历全部 2^3 种可行分配，3.4 确为最小值
+{
+  const d = [2, 2, 1.4];
+  let brute = Infinity;
+  for (const x of [0, 1]) for (const y of [0, 1]) for (const z of [0, 1]) {
+    const load = [0, 0];
+    [[x, 0], [y, 1], [z, 2]].forEach(([mi, bi]) => { load[mi] += d[bi]; });
+    brute = Math.min(brute, Math.max(...load));
+  }
+  assert.strictEqual(brute, 3.4, 'makespan 应为全部可行分配中的最小值');
+}
+// 排程附带原排料结果且不改变原排料（结构同 /api/cut）
+assert.strictEqual(sch.plan.boardsCount, 3);
+assert.deepStrictEqual(sch.plan.boards, cutBoards(schedBase).boards);
+
+// 48) 单板耗时 = 准备秒数 + 刀长合计 ÷ 速度；准备秒数逐板累加
+const schSetup = scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 500, setupSeconds: 30 },
+  { name: 'M-B', maxCutLength: 1000, speed: 2000, setupSeconds: 10 },
+] });
+// 板耗时：M-A 满板 34 秒、单板 32.8 秒；M-B 满板 11 秒、单板 10.7 秒
+// 枚举最优：三块全给 M-B = 32.7 秒（任一板转 M-A 都会使该机耗时 ≥ 32.8 秒），
+// 故 makespan = 32.7 且最优向量为 [2,2,2]
+assert.strictEqual(schSetup.assignments[0].setupSeconds, 10);
+assert.strictEqual(schSetup.assignments[0].cuttingSeconds, 1); // 2000 / 2000
+assert.strictEqual(schSetup.assignments[0].durationSeconds, 11);
+assert.strictEqual(schSetup.makespan, 32.7); // 三块全给 M-B：11 + 11 + 10.7
+assert.deepStrictEqual(schSetup.assignments.map((a) => a.machineIndex), [2, 2, 2]);
+assert.deepStrictEqual(schSetup.assignments.map((a) => [a.startSeconds, a.endSeconds]), [[0, 11], [11, 22], [22, 32.7]]);
+assert.strictEqual(schSetup.machineSchedules[0].boards.length, 0);
+assert.strictEqual(schSetup.machineSchedules[0].finishSeconds, 0); // 未分配板的机台完工为 0
+assert.strictEqual(schSetup.machineSchedules[1].finishSeconds, 32.7);
+
+// 49) 实际最长刀超过机台上限则不能分配；全部机台都超限时报错指出板号
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 700, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 750, speed: 1000, setupSeconds: 0 },
+] }), (e) => {
+  assert(e instanceof UserError);
+  assert(/第 1 张板/.test(e.message) && /第 2 张板/.test(e.message) && /第 3 张板/.test(e.message),
+    '应指出全部无可行机台的板号：' + e.message);
+  assert(/800/.test(e.message), '错误信息应附实际最长刀长：' + e.message);
+  return true;
+});
+// 部分机台受限：仅 M-B（上限 1000）能加工，三块全部排到 M-B
+const schLimited = scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 500, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] });
+assert(schLimited.assignments.every((a) => a.machine === 'M-B'));
+assert.strictEqual(schLimited.makespan, 5.4); // 2 + 2 + 1.4
+schLimited.assignments.forEach((a) => {
+  assert(a.longestCut <= a.maxCutLength, '实际最长刀不得超过所分配机台上限');
+});
+
+// 50) 超过 8 张板明确报错：板 100×100、每件 60×60 => 每板 1 件，9 件 = 9 张板
+assert.throws(() => scheduleBoards({
+  boardWidth: 100, boardHeight: 100, kerf: 0,
+  parts: [{ name: '块', width: 60, height: 60, quantity: 9 }],
+  machines: [
+    { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+    { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  ],
+}), (e) => {
+  assert(e instanceof UserError);
+  assert(/不超过 8 张板/.test(e.message) && /9 张板/.test(e.message), '超板数应明确报错：' + e.message);
+  return true;
+});
+// 恰好 8 张板可以排程
+const sch8 = scheduleBoards({
+  boardWidth: 100, boardHeight: 100, kerf: 0,
+  parts: [{ name: '块', width: 60, height: 60, quantity: 8 }],
+  machines: [
+    { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+    { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  ],
+});
+assert.strictEqual(sch8.boardsCount, 8);
+assert.strictEqual(sch8.assignments.length, 8);
+
+// 51) 无刀板（零件恰好铺满）最长刀 0、切割耗时 0，仅有准备秒数；任何机台均可分配
+const schNoCut = scheduleBoards({
+  boardWidth: 1000, boardHeight: 600, kerf: 2,
+  parts: [{ name: '整板', width: 1000, height: 600, quantity: 1 }],
+  machines: [
+    { name: 'M-A', maxCutLength: 1, speed: 1000, setupSeconds: 20 }, // 上限极小也能接受 0 刀板
+    { name: 'M-B', maxCutLength: 1, speed: 1000, setupSeconds: 30 },
+  ],
+});
+assert.strictEqual(schNoCut.boardsCount, 1);
+assert.strictEqual(schNoCut.assignments[0].longestCut, 0);
+assert.strictEqual(schNoCut.assignments[0].totalCutLength, 0);
+assert.strictEqual(schNoCut.assignments[0].cuttingSeconds, 0);
+assert.strictEqual(schNoCut.assignments[0].machineIndex, 1, '平局取字典序（机台输入序号）最小者');
+assert.strictEqual(schNoCut.makespan, 20);
+
+// 52) 机台输入校验：数量、名称唯一、各参数取值
+const schValidInput = { ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] };
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [] }), UserError, '0 台机台应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [schValidInput.machines[0]] }), UserError, '1 台机台应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-C', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-D', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] }), UserError, '4 台机台应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: ' M-A ', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+  { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] }), /机台名称重复/, '去空白后名称重复应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 0, speed: 1000, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] }), UserError, '最大单刀长度非正应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: -1, setupSeconds: 0 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] }), UserError, '切割速度非正应报错');
+assert.throws(() => scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 1000, setupSeconds: -5 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: 0 },
+] }), UserError, '准备秒数为负应报错');
+// 3 台机台可用；准备秒数留空按 0 处理
+const sch3 = scheduleBoards({ ...schedBase, machines: [
+  { name: 'M-A', maxCutLength: 1000, speed: 1000 },
+  { name: 'M-B', maxCutLength: 1000, speed: 1000, setupSeconds: '' },
+  { name: 'M-C', maxCutLength: 1000, speed: 1000, setupSeconds: null },
+] });
+assert.strictEqual(sch3.machinesCount, 3);
+assert.strictEqual(sch3.makespan, 2); // 板1 → M-A、板2 → M-B（各 2 秒），板3 → M-C（1.4 秒）
+assert.deepStrictEqual(sch3.assignments.map((a) => a.machineIndex), [1, 2, 3]);
 
 console.log('全部算法自检通过 ✔');

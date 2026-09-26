@@ -21,6 +21,12 @@
 再把本批符合回收尺寸的余料以「批次号 + 原余料编号」入池供后续批次使用
 （跨批编号不冲突）；逐批给出新开标准板数、已用与新增余板、批末库存与累计材料费，
 某批无法加工时指出批次并停止，不提交部分结果；预演不改动表单与单次排料结果。
+在已生成的裁切方案上还可登记 **2～3 台机台**（机台唯一名称、最大单刀长度、
+切割速度与每板准备秒数）做**机台开料排程**：仅接受不超过 8 张板的方案，
+每板不可拆分，实际最长刀超过机台上限则不能分配，单板耗时为准备秒数加该板
+全部刀长之和除以速度，同一机台按板号顺序连续加工；遍历全部可行分配求全部板
+完成时间最小的方案（平局按板号对应机台输入序号字典序），页面展示逐板机台、
+起止秒数与总完工秒数，**不改动原排料结果**。
 
 - 前端：React 18 + Vite
 - 后端：Node.js + Express（排料 / 分摊 / 补切算法见 `server/src/cutting.js`）
@@ -55,12 +61,13 @@ docker compose up -d --build
 
 | 用途 | 地址 |
 | --- | --- |
-| Web 页面（原板参数 / 临时余板库存 / 逐板图 / 分单取件 / 可回收余料清单 / 缺件补切 / 撤单预览 / 连续批次预演） | http://localhost:8080 |
+| Web 页面（原板参数 / 临时余板库存 / 逐板图 / 分单取件 / 可回收余料清单 / 缺件补切 / 撤单预览 / 连续批次预演 / 机台开料排程） | http://localhost:8080 |
 | 健康检查 | http://localhost:8080/api/health |
 | 排料计算 API（含余板库存 `stockBoards` 与可回收余料清单 `offcuts`） | `POST http://localhost:8080/api/cut` |
 | 缺件补切 API（补切只开标准新板，不耗用余板） | `POST http://localhost:8080/api/recut` |
 | 撤单影响预览 API（按输入快照对比撤单前后，原方案不变） | `POST http://localhost:8080/api/cancel-preview` |
 | 连续批次用料预演 API（余板池跨批流转，逐批汇总） | `POST http://localhost:8080/api/batch-preview` |
+| 机台开料排程 API（2～3 台机台，≤ 8 张板，求总完工时间最小） | `POST http://localhost:8080/api/schedule` |
 
 本地开发模式下前端为 http://localhost:5173 （`/api` 已配置代理到 8080）。
 
@@ -180,6 +187,25 @@ npm test
      （材料费只计新开标准板，逐批累加）；
    - 某批无法加工时**指出批次并停止预演，不提交部分结果**；
    - 预演为只读评估：**不改动表单与单次排料结果**。
+10. **机台开料排程**：方案生成后，在结果区底部「机台开料排程」中登记
+    **2～3 台机台**（每台填写**唯一名称**、**最大单刀长度**、**切割速度（长度单位 / 秒）**
+    与**每板准备秒数**；名称不可重复，最大单刀长度与切割速度必须为正数，
+    准备秒数必须为非负数、可留空（按 0 计）），点击「生成机台开料排程」：
+    - 排程以**当前排料输入**重算裁切方案，为只读附加结果：**原方案落位、刀路
+      与材料费分摊保持不变**；
+    - **仅接受不超过 8 张板的方案**，超出时明确报错（指出当前板数）；
+    - **每板不可拆分**：该板实际最长刀长（`boards[].longestCut`，无刀为 0）
+      超过某机台最大单刀长度时，该板不能分配给该机台；某板在全部机台上都超限时，
+      报错**指出板号**（附实际最长刀长与各机台上限）；
+    - **单板耗时 = 每板准备秒数 + 该板全部刀长之和 ÷ 切割速度**，
+      同一机台按**板号升序连续加工**（板不跨机台拆分，准备与切割都在该机台完成）；
+    - 系统**遍历全部可行分配**（板 ≤ 8、机台 ≤ 3，枚举量 ≤ 3⁸ = 6561），
+      求**全部板完成时间（各机台累计耗时最大值）最小**的方案；完工时间相同时，
+      按「各板号所分配机台的**输入序号**」向量**字典序**取最先者；
+    - 结果区展示：**总完工秒数**等汇总、**逐机台加工时间轴**（机台按板号顺序的
+      板号队列与各板起止 / 耗时、机台完工秒数，未分配板的机台完工为 0）以及
+      **逐板排程明细表**（机台及输入序号、实际最长刀 / 机台上限、刀数、刀长合计、
+      准备秒数、切割秒数、单板耗时与起止秒数）。
 
 ## 切割规则
 
@@ -308,6 +334,38 @@ npm test
 - 任一批次无法加工（零件放不下、刀长超限或输入非法）时，报错**指出批次号**并
   停止预演，**不返回任何批次结果**；预演为只读计算，不改动各批输入快照，
   也不改动表单与单次排料结果。
+
+## 机台开料排程规则
+
+- 请求体 = 排料输入（同 `/api/cut`）+ `machines`：**2～3 台机台**，每项
+  `{ name, maxCutLength, speed, setupSeconds }`：
+  - `name`：机台**唯一名称**（字符串，去空白后非空、全表不可重复）；
+  - `maxCutLength`：机台**最大单刀长度**，必须为**正数**（与板尺寸 / 刀长同单位）；
+  - `speed`：**切割速度**，必须为**正数**（长度单位 / 秒）；
+  - `setupSeconds`：**每板准备秒数**，必须为**非负数字**，留空 / 不传按 `0` 计。
+- 后端以当前排料输入重算裁切方案（与 `/api/cut` 相同规则）；排程为**只读附加
+  结果**：原方案落位、刀路、用板数与材料费分摊均不改变（响应中原方案在
+  `plan` 字段原样返回）。
+- **仅接受不超过 8 张板的方案**：`boardsCount > 8` 时直接返回 HTTP 400，
+  错误信息指出当前板数与 8 张上限。
+- **每板不可拆分**：以该板所有刀路中的实际最长刀长（无刀时为 `0`）与机台
+  最大单刀长度比较，最长刀 **超过**机台上限的板**不能**分配给该机台；
+  某板在全部机台上都超限时整体报错并**指出板号**（附该板最长刀长与各机台上限）。
+- **单板耗时（秒）** = `setupSeconds + 该板全部刀长之和 ÷ speed`
+  （刀长之和 = `boards[].cuts[].length` 之和，无刀时切割耗时为 0，只剩准备秒数）。
+- **同一机台按板号顺序连续加工**：分配到同一机台的板按板号升序串行，
+  后一板的开始秒数 = 前一板的结束秒数（首板从第 0 秒开始）；不同机台之间并行，
+  机台完工秒数即其板号队列的单板耗时累计（未分配板时为 `0`）。
+- 优化目标为**全部板完成时间（makespan，各机台完工秒数的最大值）最小**：
+  板数 ≤ 8、机台 ≤ 3 时直接**遍历全部可行分配**（≤ 3⁸ = 6561 种）求精确最优；
+  完工时间在相对容差内相同的多个最优解，按「板号 1、2、…、N 所分配机台的
+  **输入序号**（从 1 起）」向量做**字典序**比较，取最先者
+  （即尽量把小号板交给输入序号靠前的机台）。
+- 输出逐板给出机台名称与机台输入序号、实际最长刀 / 机台上限、刀数、刀长合计、
+  准备秒数、切割秒数、单板耗时与起止秒数；逐机台给出按板号顺序的加工清单与
+  完工秒数；顶层给出总完工秒数 `makespan` 与全部刀长之和 `totalCutLength`。
+- 机台数量不在 2～3、名称缺失 / 重复、最大单刀长度或切割速度非正、准备秒数
+  为负，或底层排料输入非法时，均返回 HTTP 400 与 `{ "ok": false, "error": "..." }`。
 
 ## 材料费分摊规则
 
@@ -688,6 +746,93 @@ npm test
   `finalPool`：全部批次结束后的最终余板库存。
 - 任一批次无法加工时返回 HTTP 400 与 `{ "ok": false, "error": "第 N 批无法加工：…" }`，
   不返回任何批次结果；`batches` 缺失 / 为空 / 非数组时同样返回 HTTP 400。
+
+`POST /api/schedule`（机台开料排程）
+
+请求体 = 排料输入（同 `/api/cut`，可含 `stockBoards` / `maxCutLength` 等全部参数）
++ `machines`（**2～3 台机台**）。排程以当前排料输入重算方案，**不改动原排料结果**
+（原方案在返回的 `plan` 字段中）。
+
+```json
+{
+  "boardWidth": 2440,
+  "boardHeight": 1220,
+  "kerf": 3,
+  "boardPrice": 180.00,
+  "orders": [
+    { "orderNo": "SO-1001", "parts": [{ "name": "柜门", "width": 600, "height": 400, "quantity": 8 }] }
+  ],
+  "machines": [
+    { "name": "M-1 推台锯", "maxCutLength": 2440, "speed": 120, "setupSeconds": 30 },
+    { "name": "M-2 电子锯", "maxCutLength": 1300, "speed": 200, "setupSeconds": 20 }
+  ]
+}
+```
+
+返回（节选，数值仅为示意）：
+
+```json
+{
+  "ok": true,
+  "result": {
+    "boardsCount": 3,
+    "machinesCount": 2,
+    "totalCutLength": 27755,
+    "makespan": 130.975,
+    "machines": [
+      { "name": "M-1 推台锯", "maxCutLength": 2440, "speed": 120, "setupSeconds": 30 },
+      { "name": "M-2 电子锯", "maxCutLength": 1300, "speed": 200, "setupSeconds": 20 }
+    ],
+    "assignments": [
+      { "board": 1, "machine": "M-2 电子锯", "machineIndex": 2,
+        "longestCut": 800, "maxCutLength": 1300, "cutsCount": 6,
+        "totalCutLength": 3397, "setupSeconds": 20, "cuttingSeconds": 16.985,
+        "durationSeconds": 36.985, "startSeconds": 0, "endSeconds": 36.985 },
+      { "board": 2, "machine": "M-1 推台锯", "machineIndex": 1,
+        "longestCut": 1220, "maxCutLength": 2440, "cutsCount": 19,
+        "totalCutLength": 12117, "setupSeconds": 30, "cuttingSeconds": 100.975,
+        "durationSeconds": 130.975, "startSeconds": 0, "endSeconds": 130.975 },
+      { "board": 3, "machine": "M-2 电子锯", "machineIndex": 2,
+        "longestCut": 1220, "maxCutLength": 1300, "cutsCount": 19,
+        "totalCutLength": 12241, "setupSeconds": 20, "cuttingSeconds": 61.205,
+        "durationSeconds": 81.205, "startSeconds": 36.985, "endSeconds": 118.19 }
+    ],
+    "machineSchedules": [
+      { "machine": "M-1 推台锯", "machineIndex": 1, "maxCutLength": 2440,
+        "speed": 120, "setupSeconds": 30, "boardCount": 1,
+        "boards": [{ "board": 2, "startSeconds": 0, "endSeconds": 130.975,
+          "durationSeconds": 130.975 }],
+        "finishSeconds": 130.975, "busySeconds": 130.975 },
+      { "machine": "M-2 电子锯", "machineIndex": 2, "maxCutLength": 1300,
+        "speed": 200, "setupSeconds": 20, "boardCount": 2,
+        "boards": [
+          { "board": 1, "startSeconds": 0, "endSeconds": 36.985, "durationSeconds": 36.985 },
+          { "board": 3, "startSeconds": 36.985, "endSeconds": 118.19, "durationSeconds": 81.205 }
+        ],
+        "finishSeconds": 118.19, "busySeconds": 118.19 }
+    ],
+    "plan": { "boardsCount": 3, "...": "同 /api/cut，原排料结果原样不变" }
+  }
+}
+```
+
+- `makespan`：全部板总完工秒数（各机台完工秒数的最大值，遍历全部可行分配所得
+  的最小值；平局已按板号对应机台输入序号字典序取最先者）。
+- `totalCutLength`：全部板的刀长之和（未舍入求和后统一保留 3 位小数）。
+- `assignments[]`：逐板（按板号升序）的机台名称与机台输入序号 `machineIndex`
+  （从 1 起）、实际最长刀长 `longestCut` 与该机台上限 `maxCutLength`
+  （必有 `longestCut ≤ maxCutLength`）、刀数 `cutsCount`、刀长合计
+  `totalCutLength`、准备秒数 `setupSeconds`、切割秒数 `cuttingSeconds`
+  （= 刀长合计 ÷ 速度）、单板耗时 `durationSeconds`（= 准备 + 切割）与
+  起止秒数 `startSeconds` / `endSeconds`（同一机台按板号顺序连续累计）。
+- `machineSchedules[]`：逐机台（按输入顺序）回显参数、分配板数 `boardCount`、
+  按板号顺序的加工清单 `boards[]`（板号与起止 / 耗时秒数）与完工秒数
+  `finishSeconds`（未分配板时为 `0`）。
+- `plan`：以当前排料输入重算的完整原排料方案，结构与 `/api/cut` 完全一致，
+  落位、刀路与材料费分摊不受排程影响。
+- 方案超过 8 张板、某板实际最长刀超过全部机台上限（错误信息指出板号）、
+  机台数量不在 2～3、名称缺失 / 重复、最大单刀长度 / 切割速度非正、准备秒数为负，
+  或底层排料输入非法时，返回 HTTP 400 与 `{ "ok": false, "error": "..." }`。
 
 ## 目录结构
 

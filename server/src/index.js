@@ -3,7 +3,7 @@
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
-const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError } = require('./cutting');
+const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, scheduleBoards, UserError } = require('./cutting');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8080;
@@ -68,6 +68,22 @@ app.post('/api/batch-preview', (req, res) => {
       return res.status(err.statusCode).json({ ok: false, error: err.message });
     }
     console.error('批次预演计算失败：', err);
+    res.status(500).json({ ok: false, error: '服务器内部错误' });
+  }
+});
+
+// 机台开料排程：2～3 台机台（唯一名称 / 最大单刀长度 / 切割速度 / 每板准备秒数），
+// 仅接受不超过 8 张板的方案；每板不可拆分，遍历可行分配求总完工时间最小值
+// （平局按板号对应机台输入序号字典序），输出逐板机台与起止秒数；原排料结果不变
+app.post('/api/schedule', (req, res) => {
+  try {
+    const result = scheduleBoards(req.body);
+    res.json({ ok: true, result });
+  } catch (err) {
+    if (err instanceof UserError) {
+      return res.status(err.statusCode).json({ ok: false, error: err.message });
+    }
+    console.error('机台开料排程失败：', err);
     res.status(500).json({ ok: false, error: '服务器内部错误' });
   }
 });
